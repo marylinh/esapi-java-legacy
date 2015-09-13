@@ -176,19 +176,17 @@ public class CryptoTokenTest {
         }
         try {
             ctok.setUserAccountName("");    // Can't be empty
-            fail("Failed to throw expected ValidationException");
-        } catch (ValidationException e) {
-            ;   // Success
+            fail("Failed to throw expected IllegalArgumentException");
+        } catch (Throwable t) {
+            assertTrue( t instanceof IllegalArgumentException );	// Success
         }
         try {
             ctok.setUserAccountName(null);    // Can't be null
                 // Should get one of these, depending on whether or not assertions are enabled.
-            fail("Failed to throw expected AssertionError or NullPointerException");
+            fail("Failed to throw expected IllegalArgumentException");
         } catch (ValidationException e) {
             fail("Wrong type of exception thrown (ValidationException): " + e);
-        } catch (NullPointerException e) {
-            ;   // Success
-        } catch (AssertionError e) {
+        } catch (IllegalArgumentException e) {
             ;   // Success
         }
         try {

@@ -16,7 +16,6 @@
  */
 package org.owasp.esapi.reference.crypto;
 
-import java.io.IOException;
 import java.io.UnsupportedEncodingException;
 import java.security.InvalidAlgorithmParameterException;
 import java.security.InvalidKeyException;
@@ -32,8 +31,10 @@ import java.security.SecureRandom;
 import java.security.Security;
 import java.security.Signature;
 import java.util.Date;
+import java.util.Enumeration;
 import java.util.Iterator;
 import java.util.Map;
+import java.util.Properties;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.Map.Entry;
@@ -51,6 +52,7 @@ import org.owasp.esapi.ESAPI;
 import org.owasp.esapi.EncoderConstants;
 import org.owasp.esapi.Encryptor;
 import org.owasp.esapi.Logger;
+import org.owasp.esapi.SecurityConfiguration;
 import org.owasp.esapi.codecs.Hex;
 import org.owasp.esapi.crypto.CipherSpec;
 import org.owasp.esapi.crypto.CipherText;
@@ -61,7 +63,11 @@ import org.owasp.esapi.crypto.SecurityProviderLoader;
 import org.owasp.esapi.errors.ConfigurationException;
 import org.owasp.esapi.errors.EncryptionException;
 import org.owasp.esapi.errors.IntegrityException;
-import org.owasp.esapi.reference.DefaultSecurityConfiguration;
+import org.owasp.esapi.reference.DefaultSecurityConfiguration;	// For ESAPI property names. Ugly. These
+																// really should be kept elsewhere, not in
+																// a reference implementation.
+																// TODO: Fix... maybe move to
+																// SecurityConfiguration interface?
 
 /**
  * Reference implementation of the {@code Encryptor} interface. This implementation
@@ -79,55 +85,63 @@ import org.owasp.esapi.reference.DefaultSecurityConfiguration;
  * @see org.owasp.esapi.Encryptor
  */
 public final class JavaEncryptor implements Encryptor {
-    private static volatile Encryptor singletonInstance;
 
-    // Note: This double-check pattern only works because singletonInstance
-    //       is declared to be volatile.  Usually this method is called
-    //       via ESAPI.encryptor() rather than directly.
+    // This class is no longer a singleton, but this (might be) still needed
+    // for backward compatibility. ObjFactory might do the right thing w/out
+	// it, but it is doubtful that it's ever been tested that way.
     public static Encryptor getInstance() throws EncryptionException {
-        if ( singletonInstance == null ) {
-            synchronized ( JavaEncryptor.class ) {
-                if ( singletonInstance == null ) {
-                    singletonInstance = new JavaEncryptor();
-                }
-            }
-        }
-        return singletonInstance;
+    	return new JavaEncryptor();
+    }
+    
+    public static Encryptor getInstance(Properties props) throws EncryptionException {
+    	return new JavaEncryptor(props);
     }
 
-    private static boolean initialized = false;
+    // private static boolean initialized = false;
     
+    // Holds default crypto related properties. Initialized once when class is
+    // first loaded.
+    private static Properties defaultCryptoProps_ = null;
+    
+	private String jceProviderProp_ = "SunJCE";	// Property value for Encryptor.PreferredJCEProvider
+    private Provider jceProvider_ = null;  		// Preferred JCE provider corresponding to jceProviderProp_.
+
     // encryption
-    private static SecretKeySpec secretKeySpec = null; // DISCUSS: Why static? Implies one key?!?
-    private static String encryptAlgorithm = "AES";
-    private static String encoding = "UTF-8"; 
-    private static int encryptionKeyLength = 128;
+    private SecretKeySpec secretKeySpec_ = null; // Note: Was 'static' pre-2.1.1
+    private String cipherXform_ = "AES/CBC/PKCS5Padding";
+    private String encoding_ = "UTF-8"; 
+    private int encryptionKeyLength_ = 128;
+    private byte[] ivBytes_ = null; 	// Not set by CTORs; see setIV().
+    private String useIV_Type_ = null;	// See setIV().
     
     // digital signatures
-    private static PrivateKey privateKey = null;
-	private static PublicKey publicKey = null;
-	private static String signatureAlgorithm = "SHA1withDSA";
-    private static String randomAlgorithm = "SHA1PRNG";
-	private static int signatureKeyLength = 1024;
+	private String signatureAlgorithm_ = "SHA1withDSA";
+    private String randomAlgorithm_ = "SHA1PRNG";
+	private int signatureKeyLength_ = 1024;
 	
 	// hashing
-	private static String hashAlgorithm = "SHA-512";
-	private static int hashIterations = 1024;
+	private String hashAlgorithm_ = "SHA-512";
+	private int hashIterations_ = 1024;
+
+			///// STATICS /////
+	// These need to stay static, at least for now, because if we start creating
+	// unique key pairs per instance, we are going to break some user programs
+	// which we want to avoid. Eventually, we may change this--with suitable
+	// advance warning--or, at least, attempt to persist them or/and read them
+	// from another source, such as a key store file. But that will be later,
+	// say in 2.1.2 or afterwards. It's a much bigger change and if we are
+	// going to store the private key in a key store file, we probably would
+	// want to encrypt it with a pass phrase as well as providing a pass phrase
+	// to protect the integrity of the key store.  All too important to rush
+	// even though the current approach severely restricts its use to what can
+	// be signed and verified with the current running JVM.
+    private static PrivateKey privateKey = null;
+	private static PublicKey publicKey = null;
 	
 	// Logging - DISCUSS: This "sticks" us with a specific logger to whatever it was when
 	//					  this class is first loaded. Is this a big limitation? Since there
 	//                    is no method to reset it, we may has well make it 'final' also.
 	private static Logger logger = ESAPI.getLogger("JavaEncryptor");
-	    // Used to print out warnings about deprecated methods.
-	private static int encryptCounter = 0;
-	private static int decryptCounter = 0;
-        // DISCUSS: OK to not have a property for this to set the frequency?
-        //          The desire is to persuade people to move away from these
-	    //          two deprecated encrypt(String) / decrypt(String) methods,
-        //          so perhaps the annoyance factor of not being able to
-        //          change it will help. For now, it is just hard-coded here.
-        //          We could be mean and just print a warning *every* time.
-	private static final int logEveryNthUse = 25;
 	
     // *Only* use this string for user messages for EncryptionException when
     // decryption fails. This is to prevent information leakage that may be
@@ -137,25 +151,43 @@ public final class JavaEncryptor implements Encryptor {
         "Decryption failed; see logs for details.";
 
     // # of seconds that all failed decryption attempts will take. Used to
-    // help prevent side-channel timing attacks.
-    private static int N_SECS = 2;
+    // help prevent side-channel timing attacks on failed decryption attempts.
+    // Also slows down attempted attacks a bit.
+    private static final int N_SECS = 2;
 
-	// Load the preferred JCE provider if one has been specified.
+    // We don't allow this to be overriden, but there is little point checking
+    // it everytime. We do however change it from setIV(byte[] ivBytes).
+    private static String ivType = "random";
+
+    // This is the magical version where we transitioned and started using
+    // the 'context' in our KDF.
+    public static final int TRANSITION_VERSION = KeyDerivationFunction.transitionVersion;
+    
+	// Load the default ESAPI.properties and set preferred JCE provider if one has
+    // been specified.
 	static {
 	    try {
-            SecurityProviderLoader.loadESAPIPreferredJCEProvider();
+	    	setDefaultCryptoProps();
+	    	// setMasterKeyAndSalt();
+            SecurityProviderLoader.loadESAPIPreferredJCEProvider();	// Always from ESAPI.properties file.
+            ivType = ESAPI.securityConfiguration().getIVType();
+            if (ivType == null || ivType.trim().equals("") ) {
+                ivType = "random";
+            }
         } catch (NoSuchProviderException ex) {
         	// Note that audit logging is done elsewhere in called method.
             logger.fatal(Logger.SECURITY_FAILURE,
                          "JavaEncryptor failed to load preferred JCE provider.", ex);
             throw new ExceptionInInitializerError(ex);
         }
-        setupAlgorithms();
 	}
 	
     /**
      * Generates a new strongly random secret key and salt that can be
-     * copy and pasted in the <b>ESAPI.properties</b> file.
+     * copy and pasted in the <b>ESAPI.properties</b> file. The key and
+     * salt are output, along with the property names, to standard output.
+     * Optionally, all the available crypto algorithms are displayed as well if
+     * '-print' is specified as the first argument.
      * 
      * @param args Set first argument to "-print" to display available algorithms on standard output.
      * @throws java.lang.Exception	To cover a multitude of sins, mostly in configuring ESAPI.properties.
@@ -169,8 +201,8 @@ public final class JavaEncryptor implements Encryptor {
 
 			Provider[] providers = Security.getProviders();
 			TreeMap<String, String> tm = new TreeMap<String, String>();
-			// DISCUSS: Note: We go through multiple providers, yet nowhere do I
-			//			see where we print out the PROVIDER NAME. Not all providers
+			// Note: 	Because we go through multiple providers, I decided that we
+			//			should also print out the PROVIDER NAME. Not all providers
 			//			will implement the same algorithms and some "partner" with
 			//			whom we are exchanging different cryptographic messages may
 			//			have _different_ providers in their java.security file. So
@@ -178,7 +210,6 @@ public final class JavaEncryptor implements Encryptor {
 			//			algorithm is implemented. Might be good to prepend the provider
 			//			name to the 'key' with something like "providerName: ". Thoughts?
 			for (int i = 0; i != providers.length; i++) {
-				// DISCUSS: Print security provider name here???
 					// Note: For some odd reason, Provider.keySet() returns
 					//		 Set<Object> of the property keys (which are Strings)
 					//		 contained in this provider, but Set<String> seems
@@ -209,12 +240,12 @@ public final class JavaEncryptor implements Encryptor {
         // setup algorithms -- Each of these have defaults if not set, although
 		//					   someone could set them to something invalid. If
 		//					   so a suitable exception will be thrown and displayed.
-        encryptAlgorithm = ESAPI.securityConfiguration().getEncryptionAlgorithm();
-		encryptionKeyLength = ESAPI.securityConfiguration().getEncryptionKeyLength();
-		randomAlgorithm = ESAPI.securityConfiguration().getRandomAlgorithm();
+        String encryptAlg = ESAPI.securityConfiguration().getEncryptionAlgorithm();
+		int eKeyLen = ESAPI.securityConfiguration().getEncryptionKeyLength();
+		String randomAlg = ESAPI.securityConfiguration().getRandomAlgorithm();
 
-		SecureRandom random = SecureRandom.getInstance(randomAlgorithm);
-		SecretKey secretKey = CryptoHelper.generateSecretKey(encryptAlgorithm, encryptionKeyLength);
+		SecureRandom random = SecureRandom.getInstance(randomAlg);
+		SecretKey secretKey = CryptoHelper.generateSecretKey(encryptAlg, eKeyLen);
         byte[] raw = secretKey.getEncoded();
         byte[] salt = new byte[20];	// Or 160-bits; big enough for SHA1, but not SHA-256 or SHA-512.
         random.nextBytes( salt );
@@ -233,61 +264,104 @@ public final class JavaEncryptor implements Encryptor {
      * 					Original exception will be attached as the 'cause'.
      */
     private JavaEncryptor() throws EncryptionException {
-        byte[] salt = ESAPI.securityConfiguration().getMasterSalt();
-        byte[] skey = ESAPI.securityConfiguration().getMasterKey();
-
-        assert salt != null : "Can't obtain master salt, Encryptor.MasterSalt";
-        assert salt.length >= 16 : "Encryptor.MasterSalt must be at least 16 bytes. " +
-                                   "Length is: " + salt.length + " bytes.";
-        assert skey != null : "Can't obtain master key, Encryptor.MasterKey";
-        assert skey.length >= 7 : "Encryptor.MasterKey must be at least 7 bytes. " +
-                                  "Length is: " + skey.length + " bytes.";
+        byte[] salt = getMasterSaltBytes();
+        byte[] skey = getMasterKeyBytes();
         
-        // Set up secretKeySpec for use for symmetric encryption and decryption,
+        setupPrivateInstanceVariables(null);
+        
+        // Set up secretKeySpec_ for use for symmetric encryption and decryption,
         // and set up the public/private keys for asymmetric encryption /
         // decryption.
-        // TODO: Note: If we dump ESAPI 1.4 crypto backward compatibility,
-        //       then we probably will ditch the Encryptor.EncryptionAlgorithm
-        //       property. If so, encryptAlgorithm should probably use
-        //       Encryptor.CipherTransformation and just pull off the cipher
-        //       algorithm name so we can use it here.
-        synchronized(JavaEncryptor.class) {
-            if ( ! initialized ) {
-                //
-                // For symmetric encryption
-                //
-                //      NOTE: FindBugs complains about this
-                //            (ST_WRITE_TO_STATIC_FROM_INSTANCE_METHOD) but
-                //            it should be OK since it is synchronized and only
-                //            done once. While we could separate this out and
-                //            handle in a static initializer, it just seems to
-                //            fit better here.
-                secretKeySpec = new SecretKeySpec(skey, encryptAlgorithm );
-                
-                //
-                // For asymmetric encryption (i.e., public/private key)
-                //
-                try {
-                    SecureRandom prng = SecureRandom.getInstance(randomAlgorithm);
+        
+        //
+        // For symmetric encryption
+        //
+        //      NOTE: FindBugs complains about this
+        //            (ST_WRITE_TO_STATIC_FROM_INSTANCE_METHOD) but
+        //            it should be OK since it is synchronized and only
+        //            done once. While we could separate this out and
+        //            handle in a static initializer, it just seems to
+        //            fit better here.
+        secretKeySpec_ = new SecretKeySpec(skey, algFromCipherXform( cipherXform_ ) );
 
-                    // Because hash() is not static (but it could be were in not
-                    // for the interface method specification in Encryptor), we
-                    // cannot do this initialization in a static method or static
-                    // initializer.
-                    byte[] seed = hash(new String(skey, encoding),new String(salt, encoding)).getBytes(encoding);
-                    prng.setSeed(seed);
-                    initKeyPair(prng);
-                } catch (Exception e) {
-                    throw new EncryptionException("Encryption failure", "Error creating Encryptor", e);
-                }             
-                
-                // Mark everything as initialized.
-                initialized = true;
-            }
+        //
+        // For asymmetric encryption (i.e., public/private key)
+        //
+        try {
+        	SecureRandom prng = SecureRandom.getInstance(randomAlgorithm_);
+
+        	// Because hash() is not static (but it could be were in not
+        	// for the interface method specification in Encryptor), we
+        	// cannot do this initialization in a static method or static
+        	// initializer.
+        	byte[] seed = hash(new String(skey, encoding_),new String(salt, encoding_)).getBytes(encoding_);
+        	prng.setSeed(seed);
+        	synchronized( JavaEncryptor.class ) {
+        		if ( privateKey == null ) {
+        			initKeyPair(prng);  // Needs work. Would like to save/restore key pair from keystore file.
+        		}
+        	}
+        } catch (Exception e) {
+        	throw new EncryptionException("Encryption failure", "Error creating Encryptor", e);
+        }             
+    }
+
+    /**
+     *   Construct a new {@code JavaEncryptor} instance with the specified
+     *   properties. The properties from {@code ESAPI.properties}
+     *   are first applied and the specified properties are then loaded via
+     *   the {@code Properties(Properties)} constructor to override the
+     *   defaults.
+     *
+     *   @param  props   New properties that override the default
+     *                   crypto-related properties. Note that these property
+     *                   values only apply to this particular instance. If an
+     *                   unknown property or a non-crypto related property
+     *                   is given, then those properties are simply silently
+     *                   ignored and the relevant default property is used
+     *                   instead.
+     */
+    private JavaEncryptor(Properties props) throws EncryptionException {
+    	if ( props == null ) {
+    		throw new IllegalArgumentException("Specified Properties instance may not be null for this constructor.");
+    	}
+    	
+   
+        byte[] salt = getMasterSaltBytes();
+        byte[] skey = getMasterKeyBytes();
+        
+        setupPrivateInstanceVariables(props);
+        
+        // Set up secretKeySpec_ for use for symmetric encryption and decryption,
+        // and set up the public/private keys for asymmetric encryption /
+        // decryption.
+        
+        //
+        // For symmetric encryption
+        //
+        secretKeySpec_ = new SecretKeySpec(skey, algFromCipherXform( cipherXform_ ) );
+
+        //
+        // For asymmetric encryption (i.e., public/private key)
+        //
+        try {
+        	SecureRandom prng = SecureRandom.getInstance(randomAlgorithm_);
+
+        	// Because hash() is not static (but it could be were in not
+        	// for the interface method specification in Encryptor), we
+        	// cannot do this initialization in a static method or static
+        	// initializer.
+        	byte[] seed = hash(new String(skey, encoding_),new String(salt, encoding_)).getBytes(encoding_);
+        	prng.setSeed(seed);
+        	synchronized( JavaEncryptor.class ) {
+        		if ( privateKey == null ) {
+        			initKeyPair(prng);  // Needs work. Would like to save/restore key pair from keystore file.
+        		}
+        	}
+        } catch (Exception e) {
+        	throw new EncryptionException("Encryption failure", "Error creating Encryptor", e);
         }
     }
-     
-
 
 	/**
      * {@inheritDoc}
@@ -296,7 +370,7 @@ public final class JavaEncryptor implements Encryptor {
 	 * the ESAPI SecurityConfiguration.
 	 */
 	public String hash(String plaintext, String salt) throws EncryptionException {
-		return hash( plaintext, salt, hashIterations );
+		return hash( plaintext, salt, hashIterations_ );
 	}
 	
 	/**
@@ -309,11 +383,11 @@ public final class JavaEncryptor implements Encryptor {
 	public String hash(String plaintext, String salt, int iterations) throws EncryptionException {
 		byte[] bytes = null;
 		try {
-			MessageDigest digest = MessageDigest.getInstance(hashAlgorithm);
+			MessageDigest digest = MessageDigest.getInstance(hashAlgorithm_);
 			digest.reset();
 			digest.update(ESAPI.securityConfiguration().getMasterSalt());
-			digest.update(salt.getBytes(encoding));
-			digest.update(plaintext.getBytes(encoding));
+			digest.update(salt.getBytes(encoding_));
+			digest.update(plaintext.getBytes(encoding_));
 
 			// rehash a number of times to help strengthen weak passwords
 			bytes = digest.digest();
@@ -324,9 +398,9 @@ public final class JavaEncryptor implements Encryptor {
 			String encoded = ESAPI.encoder().encodeForBase64(bytes,false);
 			return encoded;
 		} catch (NoSuchAlgorithmException e) {
-			throw new EncryptionException("Internal error", "Can't find hash algorithm " + hashAlgorithm, e);
+			throw new EncryptionException("Internal error", "Can't find hash algorithm " + hashAlgorithm_, e);
 		} catch (UnsupportedEncodingException ex) {
-			throw new EncryptionException("Internal error", "Can't find encoding for " + encoding, ex);
+			throw new EncryptionException("Internal error", "Can't find encoding for " + encoding_, ex);
 		}
 	}
 
@@ -335,7 +409,7 @@ public final class JavaEncryptor implements Encryptor {
 	*/
 	 public CipherText encrypt(PlainText plaintext) throws EncryptionException {
 		 // Now more of a convenience function for using the master key.
-		 return encrypt(secretKeySpec, plaintext);
+		 return encrypt(secretKeySpec_, plaintext);
 	 }
 	 
 	 /**
@@ -345,7 +419,7 @@ public final class JavaEncryptor implements Encryptor {
 	 			throws EncryptionException
 	 {
 		 if ( key == null ) {
-			 throw new IllegalArgumentException("(Master) encryption key arg may not be null. Is Encryptor.MasterKey set?");
+			 throw new IllegalArgumentException("(Master) encryption key arg must not be null. Is Encryptor.MasterKey set?");
 		 }
 		 if ( plain == null ) {
 			 throw new IllegalArgumentException("PlainText may arg not be null");
@@ -354,11 +428,10 @@ public final class JavaEncryptor implements Encryptor {
 		 boolean overwritePlaintext = ESAPI.securityConfiguration().overwritePlainText();
 
 		 boolean success = false;	// Used in 'finally' clause.
-		 String xform = null;
+		 String xform = cipherXform_;
 		 int keySize = key.getEncoded().length * 8;	// Convert to # bits
 
 		try {
-			 xform = ESAPI.securityConfiguration().getCipherTransformation();
              String[] parts = xform.split("/");
              assert parts.length == 3 : "Malformed cipher transformation: " + xform;
              String cipherMode = parts[1];
@@ -382,8 +455,24 @@ public final class JavaEncryptor implements Encryptor {
 			 //          public CipherText encrypt(CryptoControls ctrl, SecretKey skey, PlainText plaintext)
 			 //        and this method will just call that one.
 			 Cipher encrypter = Cipher.getInstance(xform);
+			 	// Originally, this was an assertion rather than a test because instanceof is (relatively) slow and
+			 	// we generally consider the ESAPI.properties trusted. It probably would be better (more efficient)
+                // to test 'xform', but I'm not sure how the NullCipher is specified in a cipher
+			 	// transformation... maybe NULL/mode/padding???
+                //
+                //      DISCUSS: Changed this from a assertion to an explicit check because we now allow
+                //               the JavaEncryptor.getInstance(Properties) that can override the the ESAPI.properties
+                //               default cipher transformation.  Is this okay? Probably it is only noticeable when
+                //               doing lots of encryptions in a tight loop.
+	         // assert !(encrypter instanceof javax.crypto.NullCipher) : "Cipher is instance of NullCipher: " + xform;
+             if ( encrypter instanceof javax.crypto.NullCipher ) {
+            	 String exMsg = "NullCipher specified. ESAPI does not allow NullCipher to be used. " +
+                 				"Cipher transformation was: " + xform;
+            	 throw new EncryptionException(exMsg, exMsg);
+             }
+
 			 String cipherAlg = encrypter.getAlgorithm();
-			 int keyLen = ESAPI.securityConfiguration().getEncryptionKeyLength();
+			 int keyLen = encryptionKeyLength_;
 
 			 // DISCUSS: OK, what do we want to do here if keyLen != keySize? If use keyLen, encryption
 			 //		     could fail with an exception, but perhaps that's what we want. Or we may just be
@@ -470,31 +559,34 @@ public final class JavaEncryptor implements Encryptor {
 			 if ( preferredCipherMode ) {
 			     encKey = key;
 			 } else {
+				 String kdfContext = computeKDFContext(cipherSpec.getCipherTransformation(),
+						 							   KeyDerivationFunction.kdfVersion,
+						 							   getDefaultPRF(), keySize);
 			     encKey = computeDerivedKey(KeyDerivationFunction.kdfVersion, getDefaultPRF(),
-			    		 				    key, keySize, "encryption");
+			    		 				    key, keySize, "encryption", kdfContext);
 			 }
 			 
 			 if ( cipherSpec.requiresIV() ) {
-				 String ivType = ESAPI.securityConfiguration().getIVType();
 				 IvParameterSpec ivSpec = null;
-				 if ( ivType.equalsIgnoreCase("random") ) {
+				 if ( useIV_Type_.equalsIgnoreCase("random") ) {
 					 ivBytes = ESAPI.randomizer().getRandomBytes(encrypter.getBlockSize());
-				 } else if ( ivType.equalsIgnoreCase("fixed") ) {
+				 } else if ( useIV_Type_.equalsIgnoreCase("fixed") ) {
 					 String fixedIVAsHex = ESAPI.securityConfiguration().getFixedIV();
 					 ivBytes = Hex.decode(fixedIVAsHex);
-					 /* FUTURE		 } else if ( ivType.equalsIgnoreCase("specified")) {
-					 		// FUTURE - TODO  - Create instance of specified class to use for IV generation and
-					 		//					 use it to create the ivBytes. (The intent is to make sure that
-					 		//				     1) IVs are never repeated for cipher modes like OFB and CFB, and
-					 		//					 2) to screen for weak IVs for the particular cipher algorithm.
-					 		//		In meantime, use 'random' for block cipher in feedback mode. Unlikely they will
-					 		//		be repeated unless you are salting SecureRandom with same value each time. Anything
-					 		//		monotonically increasing should be suitable, like a counter, but need to remember
-					 		//		it across JVM restarts. Was thinking of using System.currentTimeMillis(). While
-					 		//		it's not perfect it probably is good enough. Could even all (advanced) developers
-					 		//      to define their own class to create a unique IV to allow them some choice, but
-					 		//      definitely need to provide a safe, default implementation.
-					  */
+					 	// Annoy them to death with logging. (There is no convenient way to
+					 	// deprecate properties and besides, we've not had a chance to warn
+					 	// them that this was going away.
+				     logger.warning(Logger.SECURITY_AUDIT, "JavaEncryptor.encrypt(): Using fixed IV from ESAPI.properties. This is dangerous and deprecated and was only originally intended for testing. Use setIV() call instead.");
+
+				 } else if ( useIV_Type_.equalsIgnoreCase("specified")) {
+					 	// This is a kludge to allow setIV() to work. Note that we reset it to
+					 	// force them to call setIV() again before each encryption rather than
+					 	// only calling it once by resetting useIV_Type_ back to ivType, which is
+					    // set from ESAPI.properties. Hopefully that will cause them to be less
+					 	// likely to not reuse IVs, but of course we can't guarantee that.
+					 assert this.ivBytes_ != null : "Programming error in JavaEncryptor; ivBytes_ is null.";
+					 ivBytes = this.ivBytes_;
+					 this.useIV_Type_ = ivType;
 				 } else {
 					 // TODO: Update to add 'specified' once that is supported and added above.
 					 throw new ConfigurationException("Property Encryptor.ChooseIVMethod must be set to 'random' or 'fixed'");
@@ -515,9 +607,12 @@ public final class JavaEncryptor implements Encryptor {
              // do this when we are not using such a cipher mode.
 			 if ( !preferredCipherMode ) {
 			     // Compute derived key, and then use it to compute and store separate MAC in CipherText object.
+				 String kdfContext = computeKDFContext(cipherSpec.getCipherTransformation(),
+						   							   KeyDerivationFunction.kdfVersion,
+						   							   getDefaultPRF(), keySize);
 			     SecretKey authKey = computeDerivedKey(KeyDerivationFunction.kdfVersion, getDefaultPRF(),
-			    		 							   key, keySize, "authenticity");
-			     ciphertext.computeAndStoreMAC(  authKey );
+			    		 							   key, keySize, "authenticity", kdfContext);
+			     ciphertext.computeAndStoreMAC( authKey );
 			 }
 			 logger.debug(Logger.EVENT_SUCCESS, "JavaEncryptor.encrypt(SecretKey,byte[],boolean,boolean) -- success!");
 			 success = true;	// W00t!!!
@@ -557,7 +652,7 @@ public final class JavaEncryptor implements Encryptor {
 	*/
 	public PlainText decrypt(CipherText ciphertext) throws EncryptionException {
 		 // Now more of a convenience function for using the master key.
-		 return decrypt(secretKeySpec, ciphertext);
+		 return decrypt(secretKeySpec_, ciphertext);
 	}
 
 	/**
@@ -676,6 +771,7 @@ public final class JavaEncryptor implements Encryptor {
         int keySize = 0;
         try {
             Cipher decrypter = Cipher.getInstance(ciphertext.getCipherTransformation());
+            assert !(decrypter instanceof javax.crypto.NullCipher) : "Cipher is instance of NullCipher: " + ciphertext.getCipherTransformation();
             keySize = key.getEncoded().length * 8;  // Convert to # bits
 
             // Using cipher mode that supports *both* confidentiality *and* authenticity? If so, then
@@ -701,8 +797,11 @@ public final class JavaEncryptor implements Encryptor {
             	//		 methods there to support backward compatibility. Anyhow the intent
             	//		 is to prevent down grade attacks when we finally re-design and
             	//		 re-implement the MAC. Think about this in version 2.1.1.
+				String kdfContext = computeKDFContext(ciphertext.getCipherTransformation(),
+ 						  							  ciphertext.getKDFVersion(),
+ 						  							  ciphertext.getKDF_PRF(), keySize);
                 encKey = computeDerivedKey( ciphertext.getKDFVersion(), ciphertext.getKDF_PRF(),
-                		                    key, keySize, "encryption");
+                		                    key, keySize, "encryption", kdfContext);
             }
             if ( ciphertext.requiresIV() ) {
                 decrypter.init(Cipher.DECRYPT_MODE, encKey, new IvParameterSpec(ciphertext.getIV()));
@@ -734,8 +833,11 @@ public final class JavaEncryptor implements Encryptor {
             //during a code inspection.
             SecretKey authKey;
             try {
+				String kdfContext = computeKDFContext(ciphertext.getCipherTransformation(),
+							   						  ciphertext.getKDFVersion(),
+							   						  ciphertext.getKDF_PRF(), keySize);
                 authKey = computeDerivedKey( ciphertext.getKDFVersion(), ciphertext.getKDF_PRF(),
-                		                     key, keySize, "authenticity");
+                		                     key, keySize, "authenticity", kdfContext);
             } catch (Exception e1) {
                 throw new EncryptionException(DECRYPTION_FAILED,
                         "Decryption problem -- failed to compute derived key for authenticity: " + e1.getMessage(), e1);
@@ -756,15 +858,15 @@ public final class JavaEncryptor implements Encryptor {
 	*/
 	public String sign(String data) throws EncryptionException {
 		try {
-			Signature signer = Signature.getInstance(signatureAlgorithm);
+			Signature signer = Signature.getInstance(signatureAlgorithm_);
 			signer.initSign(privateKey);
-			signer.update(data.getBytes(encoding));
+			signer.update(data.getBytes(encoding_));
 			byte[] bytes = signer.sign();
 			return ESAPI.encoder().encodeForBase64(bytes, false);
 		} catch (InvalidKeyException ike) {
 			throw new EncryptionException("Encryption failure", "Must install unlimited strength crypto extension from Sun", ike);
 		} catch (Exception e) {
-			throw new EncryptionException("Signature failure", "Can't find signature algorithm " + signatureAlgorithm, e);
+			throw new EncryptionException("Signature failure", "Can't find signature algorithm " + signatureAlgorithm_, e);
 		}
 	}
 		
@@ -774,9 +876,9 @@ public final class JavaEncryptor implements Encryptor {
 	public boolean verifySignature(String signature, String data) {
 		try {
 			byte[] bytes = ESAPI.encoder().decodeFromBase64(signature);
-			Signature signer = Signature.getInstance(signatureAlgorithm);
+			Signature signer = Signature.getInstance(signatureAlgorithm_);
 			signer.initVerify(publicKey);
-			signer.update(data.getBytes(encoding));
+			signer.update(data.getBytes(encoding_));
 			return signer.verify(bytes);
 		} catch (Exception e) {
 		    // NOTE: EncryptionException constructed *only* for side-effect of causing logging.
@@ -830,7 +932,8 @@ public final class JavaEncryptor implements Encryptor {
 		        cipherText = CipherText.fromPortableSerializedBytes(encryptedBytes);
 		    } catch( AssertionError e) {
 	            // Some of the tests in EncryptorTest.testVerifySeal() are examples of
-		        // this if assertions are enabled.
+		        // this if assertions are enabled, but we don't want to throw
+		    	// AssertionErrors for this even if assertions are enabled.
 		        throw new EncryptionException("Invalid seal",
 	                                          "Seal passed garbarge data resulting in AssertionError: " + e);
 	        }
@@ -913,7 +1016,7 @@ public final class JavaEncryptor implements Encryptor {
 			//			KeyDerivationFunction.computeDerivedKey().)
 			//
 			byte[] salt = ESAPI.securityConfiguration().getMasterSalt();
-			hmac.init( new SecretKeySpec(salt, "HMacSHA1") );	// Was:	hmac.init(secretKeySpec)	
+			hmac.init( new SecretKeySpec(salt, "HMacSHA1") );	// Was:	hmac.init(secretKeySpec_)	
 			byte[] inBytes;
 			try {
 				inBytes = input.getBytes("UTF-8");
@@ -931,37 +1034,73 @@ public final class JavaEncryptor implements Encryptor {
 	    }
 	}
 ********************/
-
-    /**
-     * Log a security warning every Nth time one of the deprecated encrypt or
-     * decrypt methods are called. ('N' is hard-coded to be 25 by default, but
-     * may be changed via the system property
-     * {@code ESAPI.Encryptor.warnEveryNthUse}.) In other words, we nag
-     * them until the give in and change it. ;-)
-     * 
-     * @param where The string "encrypt" or "decrypt", corresponding to the
-     *              method that is being logged.
-     * @param msg   The message to log.
-     */
-    private void logWarning(String where, String msg) {
-        int counter = 0;
-        if ( where.equals("encrypt") ) {
-            counter = encryptCounter++;
-            where = "JavaEncryptor.encrypt(): [count=" + counter +"]";
-        } else if ( where.equals("decrypt") ) {
-            counter = decryptCounter++;
-            where = "JavaEncryptor.decrypt(): [count=" + counter +"]";
+    /////
+	/////	PROTECTED
+	/////
+	/**
+	 * Use the specified Initialization Vector (IV) for doing encryption. This
+	 * must be called before each call to any of the {@code encrypt()} methods.
+	 * 
+	 * <b>IMPORTANT NOTE:</b>	This method is really only intended to support
+	 * ESAPI crypto test vectors along the lines of NIST's Known Answer Tests
+	 * for AES and 3DES and should be avoided otherwise. That is why this method
+	 * is protected and this class is declared final. (Also, at some point, the
+	 * signing certificate will be renewed or reissued and we will again be signing
+	 * and sealing the ESAPI jar to avoid trivial cheating.) A similar, but supported
+	 * method may be provided in ESAPI 3.0 should their be sufficient demand.
+	 * 
+	 * Typical usage would be something like this:
+	 * <pre>
+	 *     	Encryptor encryptor = ESAPI.encryptor();
+   	 *		byte[] myIV = ...; 	// Get your IV bytes from somewhere.
+   	 *		CipherText ct = ((JavaEncryptor)encryptor).setIV(myIV).encrypt(new PlainText("text"));
+	 * </pre>
+	 * @param ivBytes	A byte array consisting of bytes of one cipher block length
+	 * 					(16 bytes for AES and 8 bytes for almost everything else) to
+	 * 					be used as the IV.
+	 * @return			A reference to this {@code JavaEncryptor} object.
+	 * @throws	IllegalArgumentException	Thrown if the parameter is null or has
+	 * 										a length of zero bytes or if the
+	 * 										Encryptor.ChooseIVMethod in ESAPI.properties
+	 * 										is not set to "random".
+	 */
+	protected Encryptor setIV(byte[] ivBytes)
+	{
+		if ( ivBytes == null || ivBytes.length == 0 ) {
+			throw new IllegalArgumentException("IV may not be null.");
+		}
+		if ( ! ivType.equalsIgnoreCase("random") ) {
+			throw new IllegalArgumentException("setIV() may only be called when the property " +
+											   "'Encryptor.ChooseIVMethod' in ESAPI.properties is set to 'random'.");
+		}
+        String cipherAlg = algFromCipherXform( cipherXform_ );
+        int blockSize = 0;
+        if ( cipherAlg.equals("AES") ) {
+            blockSize = 16;     // 128-bits
         } else {
-            where = "JavaEncryptor: Unknown method: ";
+                // Pretty much every thing else has a block size of 64-bits,
+                // or at least if we limit the algorithm to those supported
+                // by SunJCE. There are some, such as RC5, that have variable
+                // block sizes, but those are not easily supported via
+                // standard JCE interfaces.
+            blockSize = 8;       // 64-bits
         }
-        // We log the very first time (note the use of post-increment on the
-        // counters) and then every Nth time thereafter. Logging every single
-        // time is likely to be way too much logging.
-        if ( (counter % logEveryNthUse) == 0 ) {
-            logger.warning(Logger.SECURITY_FAILURE, where + msg);
-        }
-    }
-    
+        
+            // This is an assertion because it will cause encryption to fail if
+            // the developer doesn't get it right.
+        assert ivBytes.length == blockSize : "Cipher " + cipherAlg + " has block size of " +
+                                             blockSize + ", but IV length of " + ivBytes.length +
+                                             " doesn't match.";
+
+        this.ivBytes_ = ivBytes;
+        this.useIV_Type_ = "specified";
+		return this;
+	}
+
+	
+	/////
+	/////	PRIVATE
+	/////
     private KeyDerivationFunction.PRF_ALGORITHMS getPRF(String name) {    	
 		String prfName = null;
 		if ( name == null ) {
@@ -980,7 +1119,7 @@ public final class JavaEncryptor implements Encryptor {
     
     // Private interface to call ESAPI's KDF to get key for encryption or authenticity.
     private SecretKey computeDerivedKey(int kdfVersion, KeyDerivationFunction.PRF_ALGORITHMS prf,
-    									SecretKey kdk, int keySize, String purpose)
+    									SecretKey kdk, int keySize, String purpose, String context)
     	throws NoSuchAlgorithmException, InvalidKeyException, EncryptionException
     {
     	// These really should be turned into actual runtime checks and an
@@ -1003,26 +1142,168 @@ public final class JavaEncryptor implements Encryptor {
     	if ( kdfVersion != 0 ) {
     		kdf.setVersion(kdfVersion);
     	}
+    	if ( context != null ) {
+    		kdf.setContext(context);
+    	}
     	return kdf.computeDerivedKey(kdk, keySize, purpose);
     }
+    
+    // Compute the 'context' label that gets used by our KDF.
+    private static String computeKDFContext(String xform, int kdfVersion,
+    										KeyDerivationFunction.PRF_ALGORITHMS prf,
+    										int keySize) {
+    	assert xform != null : "Cipher transformation cannot be null.";
+    	String clabel = "";		// Same as default context in KeyDerivationFunction
+    	if ( kdfVersion >= TRANSITION_VERSION ) {	// Older versions just return "".
+    		// Do NOT *EVER* change the order of these concatenations!!!!
+    		// Yes, the code is a bit brittle, but if we change this, we will
+    		// end up with a big long switch based on specific kdfVersion.
+    		clabel = xform + Integer.toString(kdfVersion) +
+    				prf.getAlgName() + Integer.toString(keySize);
+    	}
+    	return clabel;
+    }
 
-    // Get all the algorithms we will be using from ESAPI.properties.
-    private static void setupAlgorithms() {
-        // setup algorithms
-        encryptAlgorithm = ESAPI.securityConfiguration().getEncryptionAlgorithm();
-        signatureAlgorithm = ESAPI.securityConfiguration().getDigitalSignatureAlgorithm();
-        randomAlgorithm = ESAPI.securityConfiguration().getRandomAlgorithm();
-        hashAlgorithm = ESAPI.securityConfiguration().getHashAlgorithm();
-        hashIterations = ESAPI.securityConfiguration().getHashIterations();
-        encoding = ESAPI.securityConfiguration().getCharacterEncoding();
-        encryptionKeyLength = ESAPI.securityConfiguration().getEncryptionKeyLength();
-        signatureKeyLength = ESAPI.securityConfiguration().getDigitalSignatureKeyLength();
+
+    // Set up all the private instance variables we will be using from the default properties.
+    private void setupPrivateInstanceVariables(Properties overrideProps) {
+        Properties p = null;
+        if ( overrideProps == null ) {
+           p = defaultCryptoProps_;
+        } else {
+            // Use defaultCryptoProps_ as the default and override them with specified props.
+            p = new Properties(defaultCryptoProps_);
+
+            // Enumerate through all the keys in overrideProps and apply them to p.
+            @SuppressWarnings("unchecked")
+			Enumeration<String> e = (Enumeration<String>) overrideProps.propertyNames();
+            while( e.hasMoreElements() ) {
+                String key = (String)e.nextElement();
+                String value = overrideProps.getProperty( key );
+
+                if ( p.getProperty( key ) == null ) {
+                    // DISCUSS: Threshold or drop this to 'info' or what?
+                    logger.warning(Logger.SECURITY_FAILURE, "Property with key '" + key + "' does not override any known crypto property. Typo???");
+                }
+
+                // DISCUSS: Is there any reason to exclude any particular properties here? If so, what
+                //          mechanism.
+                p.setProperty( key, value );
+            }
+        }
+
+        ////////////////////////
+        //
+        //      There is only some very basic sanity checking here; e.g., making sure that integer
+        //      property values are in fact integers and possibly checking for minimum size.
+        String sval = null;
+        int    ival = -1;
+
+        sval = p.getProperty( DefaultSecurityConfiguration.KEY_LENGTH ); 
+        ival = Integer.parseInt( sval );
+        if ( ival >= 56 ) {
+            encryptionKeyLength_ = ival;
+        } else {
+            logger.warning(Logger.SECURITY_FAILURE,
+            		"Ignoring encryption key size and using default as key size less than 56 bits.");
+        }
+
+        cipherXform_        = p.getProperty( DefaultSecurityConfiguration.CIPHER_TRANSFORMATION_IMPLEMENTATION );
+        hashAlgorithm_      = p.getProperty( DefaultSecurityConfiguration.HASH_ALGORITHM );
+        randomAlgorithm_    = p.getProperty( DefaultSecurityConfiguration.RANDOM_ALGORITHM );
+        signatureAlgorithm_ = p.getProperty( DefaultSecurityConfiguration.DIGITAL_SIGNATURE_ALGORITHM );
+
+        sval = p.getProperty( DefaultSecurityConfiguration.HASH_ITERATIONS );
+        ival = Integer.parseInt( sval );
+        hashIterations_ = ival;
+        if ( ival >= 1000 ) {
+            hashIterations_ = ival;
+        } else {
+            logger.warning(Logger.SECURITY_FAILURE,
+            		"Ignoring hash iterations and using default as hash iterations size less than 1000.");
+        }
+
+        // Allow this to be overridden?
+        encoding_ = p.getProperty( DefaultSecurityConfiguration.CHARACTER_ENCODING );
+
+        sval = p.getProperty( DefaultSecurityConfiguration.DIGITAL_SIGNATURE_KEY_LENGTH );
+        ival = Integer.parseInt( sval );
+        if ( ival >= 512 ) {
+            signatureKeyLength_ = ival;
+        } else {
+            logger.warning(Logger.SECURITY_FAILURE,
+            		"Ignoring digital signature key length default as length is than 512.");
+        }
+
+        jceProviderProp_ = p.getProperty( DefaultSecurityConfiguration.PREFERRED_JCE_PROVIDER );
+        try {
+        	jceProvider_ = SecurityProviderLoader.getProviderInstanceFor(jceProviderProp_);
+        } catch( NoSuchProviderException e ) {
+        	throw new ConfigurationException("Failed to set requested JCE Provider for '" +
+        			                         jceProvider_ + "'. Try using fully qualified classname of provider.", e);
+        }
+
+        // ivBytes_ = null;
+        useIV_Type_ = ivType;
+        return;
+    }
+    
+    // Note: There is very little sanity testing here as these are the default
+    // properties as specified by ESAPI.properties file.  For now at least,
+    // we only allow a limited # of relevant properties to be overrode.
+    private static void setDefaultCryptoProps() {
+        Properties p = new Properties();
+
+        SecurityConfiguration sc = ESAPI.securityConfiguration();
+        assert sc != null : "ESAPI.securityConfiguration() returned null!";
+
+
+        p.setProperty( DefaultSecurityConfiguration.KEY_LENGTH,
+                       Integer.toString( sc.getEncryptionKeyLength() )
+                     );
+
+        p.setProperty( DefaultSecurityConfiguration.CIPHER_TRANSFORMATION_IMPLEMENTATION,
+                       sc.getCipherTransformation()
+                     );
+
+        p.setProperty( DefaultSecurityConfiguration.HASH_ALGORITHM,
+                       sc.getHashAlgorithm()
+                     );
+
+        p.setProperty( DefaultSecurityConfiguration.RANDOM_ALGORITHM,
+                       sc.getRandomAlgorithm()
+                     );
+
+        p.setProperty( DefaultSecurityConfiguration.DIGITAL_SIGNATURE_ALGORITHM,
+                       sc.getDigitalSignatureAlgorithm()
+                     );
+
+        p.setProperty( DefaultSecurityConfiguration.HASH_ITERATIONS,
+                       Integer.toString( sc.getHashIterations() )
+                     );
+
+        // Allow this to be overridden?
+        p.setProperty( DefaultSecurityConfiguration.CHARACTER_ENCODING,
+                       sc.getCharacterEncoding()
+                     );
+
+        p.setProperty( DefaultSecurityConfiguration.DIGITAL_SIGNATURE_KEY_LENGTH,
+                       Integer.toString( sc.getDigitalSignatureKeyLength() )
+                     );
+
+        p.setProperty( DefaultSecurityConfiguration.PREFERRED_JCE_PROVIDER,
+                       sc.getPreferredJCEProvider()
+                     );
+
+        defaultCryptoProps_ = p;
+
+        return;
     }
     
     // Set up signing key pair using the master password and salt. Called (once)
     // from the JavaEncryptor CTOR.
-    private static void initKeyPair(SecureRandom prng) throws NoSuchAlgorithmException {
-        String sigAlg = signatureAlgorithm.toLowerCase();
+    private void initKeyPair(SecureRandom prng) throws NoSuchAlgorithmException {
+        String sigAlg = signatureAlgorithm_.toLowerCase();
         if ( sigAlg.endsWith("withdsa") ) {
             //
             // Admittedly, this is a kludge. However for Sun JCE, even though
@@ -1036,15 +1317,69 @@ public final class JavaEncryptor implements Encryptor {
             // this was tested with JDK 1.6.0_21, but likely fails with earlier
             // versions of the JDK as well.)
             //
+        	// Note also for DSA, we accept the default p, q, and g parameters,
+        	// otherwise, we would have to use DSAKeyPairGenerator instead of
+        	// KeyPairGenerator here so we could pass in the additional
+        	// DSAParameterSpec instance to the initialize() method. However,
+        	// there is no reason to think that the default p, q, and g
+        	// parameters are not sufficient (unless one is using a JCE
+        	// provider library written by the NSA ;-) and choosing one's own
+        	// p, q, and g parameters means something else that you need to
+        	// exchange with participating parties. So in this case, simplicity
+        	// trumps flexibility.
             sigAlg = "DSA";
         } else if ( sigAlg.endsWith("withrsa") ) {
             // Ditto for RSA.
             sigAlg = "RSA";
         }
         KeyPairGenerator keyGen = KeyPairGenerator.getInstance(sigAlg);
-        keyGen.initialize(signatureKeyLength, prng);
+        keyGen.initialize(signatureKeyLength_, prng);
         KeyPair pair = keyGen.generateKeyPair();
         privateKey = pair.getPrivate();
         publicKey = pair.getPublic();
+    }
+    
+    private static byte[] getMasterKeyBytes() {
+        byte[] skey = ESAPI.securityConfiguration().getMasterKey();
+
+        if ( skey == null ) {
+            throw new ConfigurationException("Failed to obtain master key, " +
+                                             "Encryptor.MasterKey, from " +
+                                             "ESAPI.properties file.");
+        }
+        if ( skey.length < 7 ) {
+            String errmsg = "Encryptor.Masterkey must be AT LEAST 7 bytes!";
+            errmsg += " Provided length was: " + skey.length + " bytes.";
+            throw new ConfigurationException(errmsg);
+        }
+        return skey;
+    }
+
+    private static byte[] getMasterSaltBytes() {
+        byte[] salt = ESAPI.securityConfiguration().getMasterSalt();
+
+        if ( salt == null ) {
+            throw new ConfigurationException("Failed to obtain master salt, " +
+                                             "Encryptor.MasterSalt, from " +
+                                             "ESAPI.properties file.");
+        }
+        if ( salt.length < 16 ) {
+            String errmsg = "Encryptor.MasterSalt must be AT LEAST 16 bytes!";
+            errmsg += " Provided length was: " + salt.length + " bytes.";
+            throw new ConfigurationException(errmsg);
+        }
+        return salt;
+    }
+    
+    private static String algFromCipherXform(String xform) {
+    	if ( xform == null ) {
+    		throw new IllegalArgumentException("Cipher transformation may not be null.");
+    	}
+    	String parts[] = xform.split("/");
+        if ( parts.length != 3 ) {
+            throw new IllegalArgumentException("Invalid cipher transformation string encountered. Must be of form \"alg/mode/padding\". Check Encryptor.CipherTransformation in ESAPI.properties file.");
+        }
+        String cipherAlg = parts[0];
+        return cipherAlg;
     }
 }
